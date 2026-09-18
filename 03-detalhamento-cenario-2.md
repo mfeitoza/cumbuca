@@ -202,7 +202,7 @@ O app `ledger` adota primitivas contábeis de alto desempenho e imutabilidade in
      - `version`: Controle de concorrência otimista (Compare-And-Swap).
    - Saldo disponível calculado diretamente:
 
-     $$\text{Saldo disponivel} = (\text{credits\_posted} - \text{debits\_posted}) - \text{debits\_pending}$$
+     $$\text{Saldo disponível} = (\text{credits}_{\text{posted}} - \text{debits}_{\text{posted}}) - \text{debits}_{\text{pending}}$$
 
 4. **`transfers`**:
    - Registro imutável de movimentação financeira entre duas contas (`debit_account_id` $\rightarrow$ `credit_account_id`).
