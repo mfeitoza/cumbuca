@@ -201,7 +201,7 @@ O app `ledger` adota primitivas contábeis de alto desempenho e imutabilidade in
      - `credits_pending`, `credits_posted`
      - `version`: Controle de concorrência otimista (Compare-And-Swap).
    - Saldo disponível calculado diretamente:
-     $$\text{Saldo Disponível} = (\text{credits\_posted} - \text{debits\_posted}) - \text{debits\_pending}$$
+     $$\text{Saldo disponivel} = (\text{credits\_posted} - \text{debits\_posted}) - \text{debits\_pending}$$
 4. **`transfers`**:
    - Registro imutável de movimentação financeira entre duas contas (`debit_account_id` $\rightarrow$ `credit_account_id`).
    - Implementa o ciclo de vida transacional em duas fases do TigerBeetle:
@@ -547,4 +547,3 @@ sequenceDiagram
 - [02 - Proposta de Arquitetura em Alto Nível](02-proposta-arquitetura.md)
 - [04 - Considerações Arquiteturais, Alternativas e Evoluções Futuras](04-considerações.md)
 - [Modelagem DDL do Banco de Dados (schema.sql)](schema.sql)
-- [Especificação OpenAPI do Data Plane (openapi-data-plane.yaml)](openapi-data-plane.yaml)
