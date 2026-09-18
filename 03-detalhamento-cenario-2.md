@@ -267,7 +267,7 @@ O TiDB executa em um cluster unificado (aproveitando o motor de consenso Raft e 
 
 Conforme a [especificação de Multi-Tenancy do Apache Pulsar](https://pulsar.apache.org/docs/next/concepts-multi-tenancy/), os tópicos são identificados por URLs canônicas com a seguinte estrutura:
 
-$$\text{\textbf{persistent}}://\mathbf{tenant}/\mathbf{namespace}/\mathbf{topic}$$
+`persistent://<tenant_id>/<namespace>/<topic>`
 
 - **`persistent://`**: Garante durabilidade contábil com persistência em disco distribuída via Apache BookKeeper (_fencing_, sem perda de mensagens).
 - **`tenant`**: Identificador do cliente institucional (`tenant_id`), permitindo isolamento administrativo, alocação de cotas de armazenamento e segregação de credenciais.
