@@ -226,3 +226,4 @@ flowchart LR
 - [02 - Proposta de Arquitetura em Alto Nível](02-proposta-arquitetura.md)
 - [03 - Detalhamento Técnico do Cenário 2 (Data Plane vs Control Plane)](03-detalhamento-cenario-2.md)
 - [Modelagem DDL do Banco de Dados (schema.sql)](schema.sql)
+- [Especificação OpenAPI do Data Plane (openapi-data-plane.yaml)](openapi-data-plane.yaml)

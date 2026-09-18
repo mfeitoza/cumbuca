@@ -547,3 +547,4 @@ sequenceDiagram
 - [02 - Proposta de Arquitetura em Alto Nível](02-proposta-arquitetura.md)
 - [04 - Considerações Arquiteturais, Alternativas e Evoluções Futuras](04-considerações.md)
 - [Modelagem DDL do Banco de Dados (schema.sql)](schema.sql)
+- [Especificação OpenAPI do Data Plane (openapi-data-plane.yaml)](openapi-data-plane.yaml)

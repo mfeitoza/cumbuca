@@ -1,0 +1,981 @@
+openapi: 3.0.3
+info:
+  title: Cumbuca Ledger - Data Plane API
+  version: 1.0.0
+  description: |
+    Especificação OpenAPI 3.0 das APIs críticas de **Data Plane** da arquitetura Cumbuca.
+
+    O Data Plane é responsável pela ingestão de alta vazão e baixa latência (<10ms) de transações Pix
+    e execução de transferências financeiras em duas fases (padrão TigerBeetle).
+
+    ### Principais Características
+    - **Multi-Tenancy**: O cabeçalho `X-Tenant-ID` identifica o tenant institucional e direciona a transação para o banco de dados dedicado (`client_ledger_<tenant_id>`).
+    - **Contabilidade de Dupla Entrada em Duas Fases**: Transferências iniciam como `pending` (reserva de saldo) e são consolidadas como `posted` ou canceladas como `voided`.
+    - **Valores Monetários**: Todos os valores monetários são expressos em **centavos de Real (BRL)** como inteiros (`integer`, R$ 100,00 = `10000`).
+    - **Idempotência**: O cabeçalho `Idempotency-Key` é obrigatório em operações de mutação (`POST`) para evitar duplicidade transacional.
+  contact:
+    name: Equipe de Engenharia Cumbuca
+    url: https://github.com/mfeitoza/cumbuca
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.cumbuca.local
+    description: Gateway de Borda / Ambiente Local
+  - url: https://api-dataplane.cumbuca.com
+    description: Ambiente de Produção (Data Plane Pool)
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Transferencias Pix
+    description: Iniciação, reserva em duas fases e consulta de transferências Pix enviadas.
+  - name: Contas de Clientes
+    description: Cadastro de contas de clientes, consulta cadastral e status no Ledger do tenant.
+  - name: Saldos e Extratos
+    description: Consulta em tempo real de saldos particionados e extratos contábeis de dupla entrada.
+  - name: Operacoes e Monitoramento
+    description: Probes de saúde e prontidão do nó Data Plane.
+
+paths:
+  # ============================================================================
+  # PIX OUT (TRANSFERÊNCIAS)
+  # ============================================================================
+  /v1/transfers:
+    post:
+      tags:
+        - Transferencias Pix
+      summary: Inicia uma transferência Pix enviada (Fase 1 - Pending)
+      description: |
+        Inicia a transferência financeira Pix no Data Plane.
+
+        **Ciclo Transacional em Duas Fases**:
+        1. Valida saldo disponível na conta do cliente (`balances.credits_posted - balances.debits_posted - balances.debits_pending >= amount`).
+        2. Registra o débito reservado com `status: pending` na tabela `transfers` (código contábil `100 - Pix Outgoing`).
+        3. Atualiza o saldo reservado na tabela particionada `balances` (`debits_pending += amount`).
+        4. Submete a ordem ao SPI/Bacen de forma assíncrona ou síncrona.
+        5. Retorna `202 Accepted` com a identificação da transferência e status `pending`.
+      operationId: initiatePixTransfer
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePixTransferRequest"
+      responses:
+        "202":
+          description: Transferência aceita e saldo reservado com sucesso (status pending).
+          headers:
+            Idempotency-Key:
+              $ref: "#/components/headers/IdempotencyKeyHeader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "402":
+          $ref: "#/components/responses/InsufficientFundsError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntityError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/transfers/{id}:
+    get:
+      tags:
+        - Transferencias Pix
+      summary: Consulta os detalhes e estado de uma transferência
+      description: Retorna o registro imutável da transferência contábil, incluindo seu status de ciclo de vida (`pending`, `posted` ou `voided`).
+      operationId: getPixTransferById
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - name: id
+          in: path
+          required: true
+          description: Identificador UUID único da transferência
+          schema:
+            type: string
+            format: uuid
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+      responses:
+        "200":
+          description: Detalhes da transferência contábil.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/transfers/{id}/refund:
+    post:
+      tags:
+        - Transferencias Pix
+      summary: Solicita devolução/estorno de um Pix recebido
+      description: |
+        Gera uma transferência contábil de estorno (código `102 - Devolução Pix Enviada`)
+        vinculada à transferência original recebida, obedecendo às diretrizes do MED (Mecanismo Especial de Devolução).
+      operationId: refundPixTransfer
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: id
+          in: path
+          required: true
+          description: UUID da transferência Pix original que será devolvida
+          schema:
+            type: string
+            format: uuid
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefundPixTransferRequest"
+      responses:
+        "202":
+          description: Solicitação de estorno acolhida e debitada em fase pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "402":
+          $ref: "#/components/responses/InsufficientFundsError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntityError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ============================================================================
+  # CONTAS DE CLIENTES
+  # ============================================================================
+  /v1/accounts:
+    post:
+      tags:
+        - Contas de Clientes
+      summary: Cadastra uma nova conta de cliente no Ledger
+      description: |
+        Insere um novo registro cadastral na tabela `accounts` e inicializa o registro
+        correspondente na tabela particionada `balances` (com sharding determinístico por HASH).
+      operationId: createAccount
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountRequest"
+      responses:
+        "201":
+          description: Conta cadastrada e saldo inicializado com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntityError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/accounts/{id}:
+    get:
+      tags:
+        - Contas de Clientes
+      summary: Consulta metadados cadastrais da conta
+      description: Retorna os dados cadastrais da conta do cliente (status, titularidade, chaves Pix).
+      operationId: getAccountById
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - name: id
+          in: path
+          required: true
+          description: Identificador UUID da conta
+          schema:
+            type: string
+            format: uuid
+            example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+      responses:
+        "200":
+          description: Metadados da conta.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ============================================================================
+  # SALDOS & EXTRATOS
+  # ============================================================================
+  /v1/accounts/{id}/balance:
+    get:
+      tags:
+        - Saldos e Extratos
+      summary: Consulta o saldo consolidado e reservado da conta
+      description: |
+        Consulta direta à partição de `balances` correspondente ao hash do `account_id`.
+
+        Retorna:
+        - **Saldo Disponível**: `credits_posted - debits_posted - debits_pending`
+        - **Saldo Consolidado (Contábil)**: `credits_posted - debits_posted`
+        - **Débitos Bloqueados (Pending)**: `debits_pending`
+        - **Créditos a Compensar**: `credits_pending`
+      operationId: getAccountBalance
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - name: id
+          in: path
+          required: true
+          description: UUID da conta do cliente
+          schema:
+            type: string
+            format: uuid
+            example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+      responses:
+        "200":
+          description: Saldos em tempo real da conta.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBalance"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/accounts/{id}/statement:
+    get:
+      tags:
+        - Saldos e Extratos
+      summary: Extrato contábil de lançamentos da conta
+      description: |
+        Retorna a lista paginada de lançamentos (`transfers`) onde a conta figurou como debitada ou creditada.
+        Permite filtros por data de início, data final e status contábil.
+      operationId: getAccountStatement
+      parameters:
+        - $ref: "#/components/parameters/XTenantID"
+        - name: id
+          in: path
+          required: true
+          description: UUID da conta do cliente
+          schema:
+            type: string
+            format: uuid
+            example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+        - name: status
+          in: query
+          required: false
+          description: Filtro pelo status da transferência contábil
+          schema:
+            type: string
+            enum: [all, pending, posted, voided]
+            default: posted
+        - name: start_date
+          in: query
+          required: false
+          description: Data inicial (ISO-8601 UTC)
+          schema:
+            type: string
+            format: date-time
+            example: "2026-09-01T00:00:00Z"
+        - name: end_date
+          in: query
+          required: false
+          description: Data final (ISO-8601 UTC)
+          schema:
+            type: string
+            format: date-time
+            example: "2026-09-18T23:59:59Z"
+        - name: limit
+          in: query
+          required: false
+          description: Quantidade máxima de registros por página
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: Cursor opaco para paginação sequencial de alta performance
+          schema:
+            type: string
+            example: "eyJpZCI6IjliMWRlYjRkLTNiN2QtNGJhZC05YmRkLTJiMGQ3YjNkY2I2ZCJ9"
+      responses:
+        "200":
+          description: Lançamentos contábeis encontrados.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatementResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ============================================================================
+  # OPERAÇÕES & LIVENESS
+  # ============================================================================
+  /v1/healthz:
+    get:
+      tags:
+        - Operacoes e Monitoramento
+      summary: Liveness Probe do nó Data Plane
+      description: Retorna código 200 se a instância Elixir estiver viva e respondendo a requisições HTTP.
+      operationId: checkLiveness
+      responses:
+        "200":
+          description: Serviço em execução.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  timestamp:
+                    type: string
+                    format: date-time
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/readyz:
+    get:
+      tags:
+        - Operacoes e Monitoramento
+      summary: Readiness Probe do nó Data Plane
+      description: |
+        Verifica a conectividade ativa do nó com o cluster TiDB (pool Ecto de conexões)
+        e com a camada de mensageria (Apache Pulsar / TiCDC).
+      operationId: checkReadiness
+      responses:
+        "200":
+          description: Instância pronta para roteamento de tráfego.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ready"
+                  database:
+                    type: string
+                    example: "connected"
+                  messaging:
+                    type: string
+                    example: "connected"
+        "503":
+          description: Instância temporariamente incapaz de atender requisições de clientes.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "not_ready"
+                  error:
+                    type: string
+                    example: "Database connection pool exhausted"
+
+# ==============================================================================
+# COMPONENTES E SCHEMAS
+# ==============================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token de autenticação OAuth2 / JWT emitido para o tenant ou cliente autenticado.
+
+  parameters:
+    XTenantID:
+      name: X-Tenant-ID
+      in: header
+      required: true
+      description: |
+        Identificador do Tenant institucional. Utilizado pelo Data Plane para direcionar a conexão
+        ao schema dedicado do tenant (`client_ledger_<tenant_id>`) no TiDB.
+      schema:
+        type: string
+        example: "tenant_enterprise_a"
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Chave única UUID gerada pelo cliente para garantir a idempotência de operações financeiras.
+        Previne a criação acidental de múltiplas transferências idênticas sob falhas transitórias de rede.
+      schema:
+        type: string
+        format: uuid
+        example: "c73a038b-47b6-4b9b-8bc6-a94f1c7d23d8"
+
+  headers:
+    IdempotencyKeyHeader:
+      description: Ecoa a chave de idempotência submetida na requisição original
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    # --------------------------------------------------------------------------
+    # MODELO DE TRANSFERÊNCIA (transfers)
+    # --------------------------------------------------------------------------
+    Transfer:
+      type: object
+      description: Registro contábil de movimentação financeira em duas fases (Two-Phase Transfer).
+      required:
+        - id
+        - ledger_id
+        - debit_account_id
+        - credit_account_id
+        - amount
+        - code
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identificador UUID único da transferência
+          example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+        pending_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Se status for posted ou voided, aponta para a transferência original em fase pending
+        ledger_id:
+          type: string
+          format: uuid
+          description: UUID do Ledger de clientes do tenant
+          example: "00000000-0000-0000-0000-000000000002"
+        debit_account_id:
+          type: string
+          format: uuid
+          description: Conta contábil debitada (origem dos fundos)
+          example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+        credit_account_id:
+          type: string
+          format: uuid
+          description: Conta contábil creditada (destino ou conta de trânsito 1999)
+          example: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Valor transacionado expresso em centavos de Real (BRL). R$ 150,00 = 15000.
+          example: 15000
+        code:
+          type: integer
+          description: |
+            Código de operação contábil (FK transfers_codes):
+            - `100`: Pix Outgoing (Envio Pix)
+            - `101`: Pix Incoming (Recebimento Pix)
+            - `102`: Devolução Pix Enviada
+            - `103`: Devolução Pix Recebida
+          enum: [100, 101, 102, 103]
+          example: 100
+        status:
+          type: string
+          description: |
+            Estado do ciclo de vida da transferência contábil:
+            - `pending`: Saldo retido preventivamente aguardando liquidação no Bacen/SPI.
+            - `posted`: Débito/crédito consolidado em definitivo.
+            - `voided`: Ordem rejeitada ou cancelada; saldo reservado é estornado.
+          enum: [pending, posted, voided]
+          example: "pending"
+        end_to_end_id:
+          type: string
+          nullable: true
+          description: Identificador EndToEndId gerado pelo SPI/Bacen
+          example: "E1234567820260918120000000123ABC"
+        txid:
+          type: string
+          nullable: true
+          description: Identificador de conciliação da cobrança Pix associada
+          example: "cumbuca78a9bc01def456789012345"
+        metadata:
+          type: object
+          nullable: true
+          description: Informações adicionais do pagador, recebedor e mensagem Pix
+          properties:
+            pix_key:
+              type: string
+              example: "cliente@email.com"
+            pix_key_type:
+              type: string
+              enum: [cpf, cnpj, email, phone, evp]
+              example: "email"
+            recipient_name:
+              type: string
+              example: "Empresa Parceira LTDA"
+            recipient_document:
+              type: string
+              example: "12345678000195"
+            recipient_bank_ispb:
+              type: string
+              example: "12345678"
+            description:
+              type: string
+              example: "Pagamento de serviço"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-09-18T12:30:00.123456Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-09-18T12:30:00.123456Z"
+
+    CreatePixTransferRequest:
+      type: object
+      description: Parâmetros para envio de transferência Pix.
+      required:
+        - debit_account_id
+        - amount
+        - pix_key
+        - pix_key_type
+      properties:
+        debit_account_id:
+          type: string
+          format: uuid
+          description: UUID da conta do cliente que será debitada
+          example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Valor a transferir em centavos de Real (BRL). Mínimo de 1 centavo.
+          example: 15000
+        pix_key:
+          type: string
+          description: Chave Pix do destinatário
+          example: "parceiro@empresa.com"
+        pix_key_type:
+          type: string
+          enum: [cpf, cnpj, email, phone, evp]
+          example: "email"
+        description:
+          type: string
+          maxLength: 140
+          description: Mensagem livre encaminhada ao destinatário no Pix
+          example: "Pagamento de Fatura 9981"
+        end_to_end_id:
+          type: string
+          nullable: true
+          description: EndToEndId pré-computado (opcional; se omitido, o Data Plane gera)
+          example: "E1234567820260918120000000123ABC"
+
+    RefundPixTransferRequest:
+      type: object
+      description: Parâmetros para devolução total ou parcial de um Pix recebido.
+      required:
+        - amount
+        - reason
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Valor a devolver em centavos de Real. Não pode exceder o valor do Pix recebido.
+          example: 5000
+        reason:
+          type: string
+          enum: [voluntary_refund, fraud_suspected_med, operational_error]
+          description: Motivo regulatório da devolução
+          example: "voluntary_refund"
+        details:
+          type: string
+          maxLength: 255
+          description: Justificativa descritiva da devolução
+          example: "Devolução solicitada pelo cliente por cancelamento da compra"
+
+    # --------------------------------------------------------------------------
+    # MODELO DE CONTA (accounts)
+    # --------------------------------------------------------------------------
+    Account:
+      type: object
+      description: Metadados cadastrais da conta de cliente.
+      required:
+        - id
+        - ledger_id
+        - customer_id
+        - code
+        - flags
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identificador UUID único da conta
+          example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+        ledger_id:
+          type: string
+          format: uuid
+          description: UUID do Ledger do tenant
+          example: "00000000-0000-0000-0000-000000000002"
+        customer_id:
+          type: string
+          description: Documento ou identificador do cliente final (CPF ou CNPJ)
+          example: "12345678901"
+        code:
+          type: integer
+          description: |
+            Tipo de conta contábil (FK accounts_codes):
+            - `1001`: Conta Corrente / Pagamento de Cliente
+            - `1002`: Conta Salário de Cliente
+            - `1999`: Conta de Trânsito Pix Out / In (uso do sistema)
+          enum: [1001, 1002, 1999]
+          example: 1001
+        flags:
+          type: integer
+          description: Bitflags de restrições de integridade (Flag 1 = debits_must_not_exceed_credits)
+          example: 1
+        status:
+          type: string
+          enum: [active, blocked, closed]
+          description: Status operacional da conta
+          example: "active"
+        metadata:
+          type: object
+          nullable: true
+          properties:
+            customer_name:
+              type: string
+              example: "Maria da Silva"
+            pix_keys:
+              type: array
+              items:
+                type: string
+              example: ["maria@email.com", "+5511999998888"]
+            branch_number:
+              type: string
+              example: "0001"
+            account_number:
+              type: string
+              example: "123456-7"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-09-18T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-09-18T10:00:00Z"
+
+    CreateAccountRequest:
+      type: object
+      description: Dados para criação de uma nova conta de cliente.
+      required:
+        - customer_id
+        - code
+      properties:
+        customer_id:
+          type: string
+          description: CPF (11 dígitos) ou CNPJ (14 dígitos) do cliente titular
+          example: "12345678901"
+        code:
+          type: integer
+          enum: [1001, 1002]
+          default: 1001
+          description: Tipo da conta (1001 = Pagamento/Corrente, 1002 = Salário)
+          example: 1001
+        metadata:
+          type: object
+          properties:
+            customer_name:
+              type: string
+              example: "Maria da Silva"
+            pix_keys:
+              type: array
+              items:
+                type: string
+              example: ["maria@email.com"]
+
+    # --------------------------------------------------------------------------
+    # MODELO DE SALDO (balances)
+    # --------------------------------------------------------------------------
+    AccountBalance:
+      type: object
+      description: Posição de saldos em tempo real extraída da tabela particionada `balances`.
+      required:
+        - account_id
+        - currency
+        - available_balance
+        - posted_balance
+        - debits_pending
+        - debits_posted
+        - credits_pending
+        - credits_posted
+        - version
+        - updated_at
+      properties:
+        account_id:
+          type: string
+          format: uuid
+          example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+        currency:
+          type: string
+          example: "BRL"
+        currency_scale:
+          type: integer
+          example: 2
+        available_balance:
+          type: integer
+          format: int64
+          description: |
+            Saldo livre disponível para novas transferências Pix:
+            `credits_posted - debits_posted - debits_pending`
+          example: 85000
+        posted_balance:
+          type: integer
+          format: int64
+          description: |
+            Saldo contábil já consolidado:
+            `credits_posted - debits_posted`
+          example: 100000
+        debits_pending:
+          type: integer
+          format: int64
+          description: Valores retidos em transações Pix Out em andamento (fase pending)
+          example: 15000
+        debits_posted:
+          type: integer
+          format: int64
+          description: Total histórico de saídas consolidadas
+          example: 50000
+        credits_pending:
+          type: integer
+          format: int64
+          description: Valores recebidos aguardando liquidação final
+          example: 0
+        credits_posted:
+          type: integer
+          format: int64
+          description: Total histórico de entradas consolidadas
+          example: 150000
+        version:
+          type: integer
+          format: int64
+          description: Versão de concorrência otimista (CAS) da partição de saldo
+          example: 42
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-09-18T12:30:00.123456Z"
+
+    # --------------------------------------------------------------------------
+    # EXTRATO CONTÁBIL
+    # --------------------------------------------------------------------------
+    StatementResponse:
+      type: object
+      required:
+        - account_id
+        - pagination
+        - items
+      properties:
+        account_id:
+          type: string
+          format: uuid
+          example: "e58ed763-928c-4155-bee9-fdbaaadc15f3"
+        pagination:
+          type: object
+          properties:
+            limit:
+              type: integer
+              example: 20
+            has_more:
+              type: boolean
+              example: true
+            next_cursor:
+              type: string
+              nullable: true
+              example: "eyJpZCI6IjliMWRlYjRkLTNiN2QtNGJhZC05YmRkLTJiMGQ3YjNkY2I2ZCJ9"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transfer"
+
+    # --------------------------------------------------------------------------
+    # RESPOSTAS DE ERRO PADRONIZADAS (RFC 7807 / Problem Details)
+    # --------------------------------------------------------------------------
+    ErrorResponse:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - code
+        - timestamp
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI de documentação técnica do tipo de erro
+          example: "https://docs.cumbuca.com/errors/insufficient-funds"
+        title:
+          type: string
+          description: Título resumido da falha
+          example: "Saldo Insuficiente"
+        status:
+          type: integer
+          description: Código HTTP retornado
+          example: 402
+        detail:
+          type: string
+          description: Explicação legível e circunstanciada do erro
+          example: "A conta não possui saldo disponível suficiente para cobrir o valor de R$ 150,00 solicitado."
+        code:
+          type: string
+          description: Código de erro tipado da aplicação para tratamento programático
+          example: "INSUFFICIENT_FUNDS"
+        instance:
+          type: string
+          description: URI do endpoint que originou a requisição
+          example: "/v1/transfers"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-09-18T12:30:00.000000Z"
+        invalid_params:
+          type: array
+          nullable: true
+          description: Detalhamento de campos inválidos sob erros de validação (422)
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                example: "amount"
+              reason:
+                type: string
+                example: "O valor deve ser estritamente maior que zero."
+
+  responses:
+    BadRequestError:
+      description: Requisição malformada ou parâmetros obrigatórios ausentes.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            type: "https://docs.cumbuca.com/errors/bad-request"
+            title: "Requisição Inválida"
+            status: 400
+            code: "BAD_REQUEST"
+            detail: "O cabeçalho X-Tenant-ID é obrigatório para roteamento da requisição."
+            instance: "/v1/transfers"
+            timestamp: "2026-09-18T12:30:00Z"
+
+    InsufficientFundsError:
+      description: Saldo disponível insuficiente na conta para cobrir o débito pretendido.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            type: "https://docs.cumbuca.com/errors/insufficient-funds"
+            title: "Saldo Insuficiente"
+            status: 402
+            code: "INSUFFICIENT_FUNDS"
+            detail: "Saldo disponível insuficiente para realizar a transferência de R$ 150,00."
+            instance: "/v1/transfers"
+            timestamp: "2026-09-18T12:30:00Z"
+
+    NotFoundError:
+      description: O recurso solicitado (conta ou transferência) não foi encontrado.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            type: "https://docs.cumbuca.com/errors/not-found"
+            title: "Recurso Não Encontrado"
+            status: 404
+            code: "RESOURCE_NOT_FOUND"
+            detail: "A conta informada não existe no Ledger deste tenant."
+            instance: "/v1/accounts/e58ed763-928c-4155-bee9-fdbaaadc15f3"
+            timestamp: "2026-09-18T12:30:00Z"
+
+    ConflictError:
+      description: "Conflito de unicidade de chave (ex.: chave de idempotência já processada ou chave Pix duplicada)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            type: "https://docs.cumbuca.com/errors/conflict"
+            title: "Conflito de Idempotência"
+            status: 409
+            code: "IDEMPOTENCY_CONFLICT"
+            detail: "Uma operação diferente já foi processada anteriormente com esta mesma Idempotency-Key."
+            instance: "/v1/transfers"
+            timestamp: "2026-09-18T12:30:00Z"
+
+    UnprocessableEntityError:
+      description: Erro de validação semântica nos dados enviados no payload.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            type: "https://docs.cumbuca.com/errors/unprocessable-entity"
+            title: "Erro de Validação"
+            status: 422
+            code: "VALIDATION_FAILED"
+            detail: "Um ou mais campos do formulário contêm valores semanticamente inválidos."
+            instance: "/v1/transfers"
+            timestamp: "2026-09-18T12:30:00Z"
+            invalid_params:
+              - name: "pix_key"
+                reason: "O formato da chave Pix de e-mail informada é inválido."
+
+    InternalServerError:
+      description: Falha interna no servidor ou indisponibilidade temporária de subsistemas.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            type: "https://docs.cumbuca.com/errors/internal-error"
+            title: "Erro Interno do Servidor"
+            status: 500
+            code: "INTERNAL_SERVER_ERROR"
+            detail: "Ocorreu uma falha inesperada durante a execução da transação. Tente novamente em instantes."
+            instance: "/v1/transfers"
+            timestamp: "2026-09-18T12:30:00Z"
